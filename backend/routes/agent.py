@@ -1,0 +1,477 @@
+"""Agent API routes — REST + SSE endpoints.
+
+All routes (except /health) require authentication via the get_current_user
+dependency. In dev mode (no OAUTH_CLIENT_ID), auth is bypassed automatically.
+"""
+
+import asyncio
+import json
+import logging
+import os
+from typing import Any
+
+from dependencies import get_current_user
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Request,
+)
+from fastapi.responses import StreamingResponse
+from litellm import acompletion
+from models import (
+    ApprovalRequest,
+    HealthResponse,
+    LLMHealthResponse,
+    SessionInfo,
+    SessionResponse,
+    SubmitRequest,
+    TruncateRequest,
+)
+from session_manager import MAX_SESSIONS, SessionCapacityError, session_manager
+
+from agent.core.agent_loop import _resolve_hf_router_params
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api", tags=["agent"])
+
+AVAILABLE_MODELS = [
+    {
+        "id": "anthropic/claude-opus-4-6",
+        "label": "Claude Opus 4.6",
+        "provider": "anthropic",
+        "recommended": True,
+    },
+    {
+        "id": "huggingface/fireworks-ai/MiniMaxAI/MiniMax-M2.5",
+        "label": "MiniMax M2.5",
+        "provider": "huggingface",
+        "recommended": True,
+    },
+    {
+        "id": "huggingface/novita/moonshotai/kimi-k2.5",
+        "label": "Kimi K2.5",
+        "provider": "huggingface",
+    },
+    {
+        "id": "huggingface/novita/zai-org/glm-5",
+        "label": "GLM 5",
+        "provider": "huggingface",
+    },
+]
+
+
+def _check_session_access(session_id: str, user: dict[str, Any]) -> None:
+    """Verify the user has access to the given session. Raises 403 or 404."""
+    info = session_manager.get_session_info(session_id)
+    if not info:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if not session_manager.verify_session_access(session_id, user["user_id"]):
+        raise HTTPException(status_code=403, detail="Access denied to this session")
+
+
+@router.get("/health", response_model=HealthResponse)
+async def health_check() -> HealthResponse:
+    """Health check endpoint."""
+    return HealthResponse(
+        status="ok",
+        active_sessions=session_manager.active_session_count,
+        max_sessions=MAX_SESSIONS,
+    )
+
+
+@router.get("/health/llm", response_model=LLMHealthResponse)
+async def llm_health_check() -> LLMHealthResponse:
+    """Check if the LLM provider is reachable and the API key is valid.
+
+    Makes a minimal 1-token completion call.  Catches common errors:
+    - 401 → invalid API key
+    - 402/insufficient_quota → out of credits
+    - 429 → rate limited
+    - timeout / network → provider unreachable
+    """
+    model = session_manager.config.model_name
+    try:
+        llm_params = _resolve_hf_router_params(model)
+        await acompletion(
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=1,
+            timeout=10,
+            **llm_params,
+        )
+        return LLMHealthResponse(status="ok", model=model)
+    except Exception as e:
+        err_str = str(e).lower()
+        error_type = "unknown"
+
+        if (
+            "401" in err_str
+            or "auth" in err_str
+            or "invalid" in err_str
+            or "api key" in err_str
+        ):
+            error_type = "auth"
+        elif (
+            "402" in err_str
+            or "credit" in err_str
+            or "quota" in err_str
+            or "insufficient" in err_str
+            or "billing" in err_str
+        ):
+            error_type = "credits"
+        elif "429" in err_str or "rate" in err_str:
+            error_type = "rate_limit"
+        elif "timeout" in err_str or "connect" in err_str or "network" in err_str:
+            error_type = "network"
+
+        logger.warning(f"LLM health check failed ({error_type}): {e}")
+        return LLMHealthResponse(
+            status="error",
+            model=model,
+            error=str(e)[:500],
+            error_type=error_type,
+        )
+
+
+@router.get("/config/model")
+async def get_model() -> dict:
+    """Get current model and available models. No auth required."""
+    return {
+        "current": session_manager.config.model_name,
+        "available": AVAILABLE_MODELS,
+    }
+
+
+@router.post("/config/model")
+async def set_model(body: dict, user: dict = Depends(get_current_user)) -> dict:
+    """Set the LLM model. Applies to new conversations."""
+    model_id = body.get("model")
+    if not model_id:
+        raise HTTPException(status_code=400, detail="Missing 'model' field")
+    valid_ids = {m["id"] for m in AVAILABLE_MODELS}
+    if model_id not in valid_ids:
+        raise HTTPException(status_code=400, detail=f"Unknown model: {model_id}")
+    session_manager.config.model_name = model_id
+    logger.info(f"Model changed to {model_id} by {user.get('username', 'unknown')}")
+    return {"model": model_id}
+
+
+@router.post("/title")
+async def generate_title(
+    request: SubmitRequest, user: dict = Depends(get_current_user)
+) -> dict:
+    """Generate a short title for a chat session based on the first user message."""
+    model = session_manager.config.model_name
+    llm_params = _resolve_hf_router_params(model)
+    try:
+        response = await acompletion(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Generate a very short title (max 6 words) for a chat conversation "
+                        "that starts with the following user message. "
+                        "Reply with ONLY the title, no quotes, no punctuation at the end."
+                    ),
+                },
+                {"role": "user", "content": request.text[:500]},
+            ],
+            max_tokens=20,
+            temperature=0.3,
+            timeout=8,
+            **llm_params,
+        )
+        title = response.choices[0].message.content.strip().strip('"').strip("'")
+        # Safety: cap at 50 chars
+        if len(title) > 50:
+            title = title[:50].rstrip() + "…"
+        return {"title": title}
+    except Exception as e:
+        logger.warning(f"Title generation failed: {e}")
+        # Fallback: truncate the message
+        fallback = request.text.strip()
+        title = fallback[:40].rstrip() + "…" if len(fallback) > 40 else fallback
+        return {"title": title}
+
+
+@router.post("/session", response_model=SessionResponse)
+async def create_session(
+    request: Request, user: dict = Depends(get_current_user)
+) -> SessionResponse:
+    """Create a new agent session bound to the authenticated user.
+
+    The user's HF access token is extracted from the Authorization header
+    and stored in the session so that tools (e.g. hf_jobs) can act on
+    behalf of the user.
+
+    Returns 503 if the server or user has reached the session limit.
+    """
+    # Extract the user's HF token (Bearer header, HttpOnly cookie, or env var)
+    hf_token = None
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        hf_token = auth_header[7:]
+    if not hf_token:
+        hf_token = request.cookies.get("hf_access_token")
+    if not hf_token:
+        hf_token = os.environ.get("HF_TOKEN")
+
+    try:
+        session_id = await session_manager.create_session(
+            user_id=user["user_id"], hf_token=hf_token
+        )
+    except SessionCapacityError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    return SessionResponse(session_id=session_id, ready=True)
+
+
+@router.get("/session/{session_id}", response_model=SessionInfo)
+async def get_session(
+    session_id: str, user: dict = Depends(get_current_user)
+) -> SessionInfo:
+    """Get session information. Only accessible by the session owner."""
+    _check_session_access(session_id, user)
+    info = session_manager.get_session_info(session_id)
+    return SessionInfo(**info)
+
+
+@router.get("/sessions", response_model=list[SessionInfo])
+async def list_sessions(user: dict = Depends(get_current_user)) -> list[SessionInfo]:
+    """List sessions belonging to the authenticated user."""
+    sessions = session_manager.list_sessions(user_id=user["user_id"])
+    return [SessionInfo(**s) for s in sessions]
+
+
+@router.delete("/session/{session_id}")
+async def delete_session(
+    session_id: str, user: dict = Depends(get_current_user)
+) -> dict:
+    """Delete a session. Only accessible by the session owner."""
+    _check_session_access(session_id, user)
+    success = await session_manager.delete_session(session_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"status": "deleted", "session_id": session_id}
+
+
+@router.post("/submit")
+async def submit_input(
+    request: SubmitRequest, user: dict = Depends(get_current_user)
+) -> dict:
+    """Submit user input to a session. Only accessible by the session owner."""
+    _check_session_access(request.session_id, user)
+    success = await session_manager.submit_user_input(request.session_id, request.text)
+    if not success:
+        raise HTTPException(status_code=404, detail="Session not found or inactive")
+    return {"status": "submitted", "session_id": request.session_id}
+
+
+@router.post("/approve")
+async def submit_approval(
+    request: ApprovalRequest, user: dict = Depends(get_current_user)
+) -> dict:
+    """Submit tool approvals to a session. Only accessible by the session owner."""
+    _check_session_access(request.session_id, user)
+    approvals = [
+        {
+            "tool_call_id": a.tool_call_id,
+            "approved": a.approved,
+            "feedback": a.feedback,
+            "edited_script": a.edited_script,
+        }
+        for a in request.approvals
+    ]
+    success = await session_manager.submit_approval(request.session_id, approvals)
+    if not success:
+        raise HTTPException(status_code=404, detail="Session not found or inactive")
+    return {"status": "submitted", "session_id": request.session_id}
+
+
+@router.post("/chat/{session_id}")
+async def chat_sse(
+    session_id: str,
+    request: Request,
+    user: dict = Depends(get_current_user),
+) -> StreamingResponse:
+    """SSE endpoint: submit input or approval, then stream events until turn ends."""
+    _check_session_access(session_id, user)
+
+    agent_session = session_manager.sessions.get(session_id)
+    if not agent_session or not agent_session.is_active:
+        raise HTTPException(status_code=404, detail="Session not found or inactive")
+
+    # Parse body
+    body = await request.json()
+
+    # Subscribe BEFORE submitting so we never miss events — even if the
+    # agent loop processes the submission before this coroutine continues.
+    broadcaster = agent_session.broadcaster
+    sub_id, event_queue = broadcaster.subscribe()
+
+    # Submit the operation
+    text = body.get("text")
+    approvals = body.get("approvals")
+
+    try:
+        if approvals:
+            formatted = [
+                {
+                    "tool_call_id": a["tool_call_id"],
+                    "approved": a["approved"],
+                    "feedback": a.get("feedback"),
+                    "edited_script": a.get("edited_script"),
+                }
+                for a in approvals
+            ]
+            success = await session_manager.submit_approval(session_id, formatted)
+        elif text is not None:
+            success = await session_manager.submit_user_input(session_id, text)
+        else:
+            broadcaster.unsubscribe(sub_id)
+            raise HTTPException(status_code=400, detail="Must provide 'text' or 'approvals'")
+
+        if not success:
+            broadcaster.unsubscribe(sub_id)
+            raise HTTPException(status_code=404, detail="Session not found or inactive")
+    except HTTPException:
+        raise
+    except Exception:
+        broadcaster.unsubscribe(sub_id)
+        raise
+
+    return _sse_response(broadcaster, event_queue, sub_id)
+
+
+# ---------------------------------------------------------------------------
+# Shared SSE helpers
+# ---------------------------------------------------------------------------
+_TERMINAL_EVENTS = {"turn_complete", "approval_required", "error", "interrupted", "shutdown"}
+_SSE_KEEPALIVE_SECONDS = 15
+
+
+def _sse_response(broadcaster, event_queue, sub_id) -> StreamingResponse:
+    """Build a StreamingResponse that drains *event_queue* as SSE,
+    sending keepalive comments every 15 s to prevent proxy timeouts."""
+
+    async def event_generator():
+        try:
+            while True:
+                try:
+                    msg = await asyncio.wait_for(
+                        event_queue.get(), timeout=_SSE_KEEPALIVE_SECONDS
+                    )
+                except asyncio.TimeoutError:
+                    # SSE comment — ignored by parsers, keeps connection alive
+                    yield ": keepalive\n\n"
+                    continue
+                event_type = msg.get("event_type", "")
+                yield f"data: {json.dumps(msg)}\n\n"
+                if event_type in _TERMINAL_EVENTS:
+                    break
+        finally:
+            broadcaster.unsubscribe(sub_id)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get("/events/{session_id}")
+async def subscribe_events(
+    session_id: str,
+    user: dict = Depends(get_current_user),
+) -> StreamingResponse:
+    """Subscribe to events for a running session without submitting new input.
+
+    Used by the frontend to re-attach after a connection drop (e.g. screen
+    sleep).  Returns 404 if the session isn't active or isn't processing.
+    """
+    _check_session_access(session_id, user)
+
+    agent_session = session_manager.sessions.get(session_id)
+    if not agent_session or not agent_session.is_active:
+        raise HTTPException(status_code=404, detail="Session not found or inactive")
+
+    broadcaster = agent_session.broadcaster
+    sub_id, event_queue = broadcaster.subscribe()
+    return _sse_response(broadcaster, event_queue, sub_id)
+
+
+@router.post("/interrupt/{session_id}")
+async def interrupt_session(
+    session_id: str, user: dict = Depends(get_current_user)
+) -> dict:
+    """Interrupt the current operation in a session."""
+    _check_session_access(session_id, user)
+    success = await session_manager.interrupt(session_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Session not found or inactive")
+    return {"status": "interrupted", "session_id": session_id}
+
+
+@router.get("/session/{session_id}/messages")
+async def get_session_messages(
+    session_id: str, user: dict = Depends(get_current_user)
+) -> list[dict]:
+    """Return the session's message history from memory."""
+    _check_session_access(session_id, user)
+    agent_session = session_manager.sessions.get(session_id)
+    if not agent_session or not agent_session.is_active:
+        raise HTTPException(status_code=404, detail="Session not found or inactive")
+    return [msg.model_dump() for msg in agent_session.session.context_manager.items]
+
+
+@router.post("/undo/{session_id}")
+async def undo_session(session_id: str, user: dict = Depends(get_current_user)) -> dict:
+    """Undo the last turn in a session."""
+    _check_session_access(session_id, user)
+    success = await session_manager.undo(session_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Session not found or inactive")
+    return {"status": "undo_requested", "session_id": session_id}
+
+
+@router.post("/truncate/{session_id}")
+async def truncate_session(
+    session_id: str, body: TruncateRequest, user: dict = Depends(get_current_user)
+) -> dict:
+    """Truncate conversation to before a specific user message."""
+    _check_session_access(session_id, user)
+    success = await session_manager.truncate(session_id, body.user_message_index)
+    if not success:
+        raise HTTPException(status_code=404, detail="Session not found, inactive, or message index out of range")
+    return {"status": "truncated", "session_id": session_id}
+
+
+@router.post("/compact/{session_id}")
+async def compact_session(
+    session_id: str, user: dict = Depends(get_current_user)
+) -> dict:
+    """Compact the context in a session."""
+    _check_session_access(session_id, user)
+    success = await session_manager.compact(session_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Session not found or inactive")
+    return {"status": "compact_requested", "session_id": session_id}
+
+
+@router.post("/shutdown/{session_id}")
+async def shutdown_session(
+    session_id: str, user: dict = Depends(get_current_user)
+) -> dict:
+    """Shutdown a session."""
+    _check_session_access(session_id, user)
+    success = await session_manager.shutdown_session(session_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Session not found or inactive")
+    return {"status": "shutdown_requested", "session_id": session_id}
+
+

@@ -1,0 +1,335 @@
+"""
+Context management for conversation history
+"""
+
+import logging
+import os
+import zoneinfo
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import yaml
+from jinja2 import Template
+from litellm import Message, acompletion
+
+logger = logging.getLogger(__name__)
+
+_HF_WHOAMI_URL = "https://huggingface.co/api/whoami-v2"
+_HF_WHOAMI_TIMEOUT = 5  # seconds
+
+
+def _get_hf_username(hf_token: str | None = None) -> str:
+    """Return the HF username for the given token.
+
+    Uses subprocess + curl to avoid Python HTTP client IPv6 issues that
+    cause 40+ second hangs (httpx/urllib try IPv6 first which times out
+    at OS level before falling back to IPv4 — the "Happy Eyeballs" problem).
+    """
+    import json
+    import subprocess
+    import time as _t
+
+    if not hf_token:
+        logger.warning("No hf_token provided, using 'unknown' as username")
+        return "unknown"
+
+    t0 = _t.monotonic()
+    try:
+        result = subprocess.run(
+            [
+                "curl",
+                "-s",
+                "-4",  # force IPv4
+                "-m",
+                str(_HF_WHOAMI_TIMEOUT),  # max time
+                "-H",
+                f"Authorization: Bearer {hf_token}",
+                _HF_WHOAMI_URL,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_HF_WHOAMI_TIMEOUT + 2,
+        )
+        t1 = _t.monotonic()
+        if result.returncode == 0 and result.stdout:
+            data = json.loads(result.stdout)
+            username = data.get("name", "unknown")
+            logger.info(f"HF username resolved to '{username}' in {t1 - t0:.2f}s")
+            return username
+        else:
+            logger.warning(
+                f"curl whoami failed (rc={result.returncode}) in {t1 - t0:.2f}s"
+            )
+            return "unknown"
+    except Exception as e:
+        t1 = _t.monotonic()
+        logger.warning(f"HF whoami failed in {t1 - t0:.2f}s: {e}")
+        return "unknown"
+
+
+class ContextManager:
+    """Manages conversation context and message history for the agent"""
+
+    def __init__(
+        self,
+        max_context: int = 180_000,
+        compact_size: float = 0.1,
+        untouched_messages: int = 5,
+        tool_specs: list[dict[str, Any]] | None = None,
+        prompt_file_suffix: str = "system_prompt_v3.yaml",
+        hf_token: str | None = None,
+        local_mode: bool = False,
+    ):
+        self.system_prompt = self._load_system_prompt(
+            tool_specs or [],
+            prompt_file_suffix="system_prompt_v3.yaml",
+            hf_token=hf_token,
+            local_mode=local_mode,
+        )
+        self.max_context = max_context - 10000
+        self.compact_size = int(max_context * compact_size)
+        self.context_length = 0  # Updated after each LLM call with actual usage
+        self.untouched_messages = untouched_messages
+        self.items: list[Message] = [Message(role="system", content=self.system_prompt)]
+
+    def _load_system_prompt(
+        self,
+        tool_specs: list[dict[str, Any]],
+        prompt_file_suffix: str = "system_prompt.yaml",
+        hf_token: str | None = None,
+        local_mode: bool = False,
+    ):
+        """Load and render the system prompt from YAML file with Jinja2"""
+        prompt_file = Path(__file__).parent.parent / "prompts" / f"{prompt_file_suffix}"
+
+        with open(prompt_file, "r") as f:
+            prompt_data = yaml.safe_load(f)
+            template_str = prompt_data.get("system_prompt", "")
+
+        # Get current date and time
+        tz = zoneinfo.ZoneInfo("Europe/Paris")
+        now = datetime.now(tz)
+        current_date = now.strftime("%d-%m-%Y")
+        current_time = now.strftime("%H:%M:%S.%f")[:-3]
+        current_timezone = f"{now.strftime('%Z')} (UTC{now.strftime('%z')[:3]}:{now.strftime('%z')[3:]})"
+
+        # Get HF user info from OAuth token
+        hf_user_info = _get_hf_username(hf_token)
+
+        template = Template(template_str)
+        static_prompt = template.render(
+            tools=tool_specs,
+            num_tools=len(tool_specs),
+        )
+
+        # CLI-specific context for local mode
+        if local_mode:
+            import os
+            cwd = os.getcwd()
+            local_context = (
+                f"\n\n# CLI / Local mode\n\n"
+                f"You are running as a local CLI tool on the user's machine. "
+                f"There is NO sandbox — bash, read, write, and edit operate directly "
+                f"on the local filesystem.\n\n"
+                f"Working directory: {cwd}\n"
+                f"Use absolute paths or paths relative to the working directory. "
+                f"Do NOT use /app/ paths — that is a sandbox convention that does not apply here.\n"
+                f"The sandbox_create tool is NOT available. Run code directly with bash."
+            )
+            static_prompt += local_context
+
+        return (
+            f"{static_prompt}\n\n"
+            f"[Session context: Date={current_date}, Time={current_time}, "
+            f"Timezone={current_timezone}, User={hf_user_info}, "
+            f"Tools={len(tool_specs)}]"
+        )
+
+    def add_message(self, message: Message, token_count: int = None) -> None:
+        """Add a message to the history"""
+        if token_count:
+            self.context_length = token_count
+        self.items.append(message)
+
+    def get_messages(self) -> list[Message]:
+        """Get all messages for sending to LLM.
+
+        Patches any dangling tool_calls (assistant messages with tool_calls
+        that have no matching tool-result message) so the LLM API doesn't
+        reject the request.
+        """
+        self._patch_dangling_tool_calls()
+        return self.items
+
+    @staticmethod
+    def _normalize_tool_calls(msg: Message) -> None:
+        """Ensure msg.tool_calls contains proper ToolCall objects, not dicts.
+
+        litellm's Message has validate_assignment=False (Pydantic v2 default),
+        so direct attribute assignment (e.g. inside litellm's streaming handler)
+        can leave raw dicts.  Re-assigning via the constructor fixes this.
+        """
+        from litellm import ChatCompletionMessageToolCall as ToolCall
+
+        tool_calls = getattr(msg, "tool_calls", None)
+        if not tool_calls:
+            return
+        needs_fix = any(isinstance(tc, dict) for tc in tool_calls)
+        if not needs_fix:
+            return
+        msg.tool_calls = [
+            tc if not isinstance(tc, dict) else ToolCall(**tc) for tc in tool_calls
+        ]
+
+    def _patch_dangling_tool_calls(self) -> None:
+        """Add stub tool results for any tool_calls that lack a matching result.
+
+        Scans backwards to find the last assistant message with tool_calls,
+        which may not be items[-1] if some tool results were already added.
+        """
+        if not self.items:
+            return
+
+        # Find the last assistant message with tool_calls
+        assistant_msg = None
+        for i in range(len(self.items) - 1, -1, -1):
+            msg = self.items[i]
+            if getattr(msg, "role", None) == "assistant" and getattr(
+                msg, "tool_calls", None
+            ):
+                assistant_msg = msg
+                break
+            # Stop scanning once we hit a user message — anything before
+            # that belongs to a previous (complete) turn.
+            if getattr(msg, "role", None) == "user":
+                break
+
+        if not assistant_msg:
+            return
+
+        self._normalize_tool_calls(assistant_msg)
+        answered_ids = {
+            getattr(m, "tool_call_id", None)
+            for m in self.items
+            if getattr(m, "role", None) == "tool"
+        }
+        for tc in assistant_msg.tool_calls:
+            if tc.id not in answered_ids:
+                self.items.append(
+                    Message(
+                        role="tool",
+                        content="Tool was not executed (interrupted or error).",
+                        tool_call_id=tc.id,
+                        name=tc.function.name,
+                    )
+                )
+
+    def undo_last_turn(self) -> bool:
+        """Remove the last complete turn (user msg + all assistant/tool msgs that follow).
+
+        Pops from the end until the last user message is removed, keeping the
+        tool_use/tool_result pairing valid. Never removes the system message.
+
+        Returns True if a user message was found and removed.
+        """
+        if len(self.items) <= 1:
+            return False
+
+        while len(self.items) > 1:
+            msg = self.items.pop()
+            if getattr(msg, "role", None) == "user":
+                return True
+
+        return False
+
+    def truncate_to_user_message(self, user_message_index: int) -> bool:
+        """Truncate history to just before the Nth user message (0-indexed).
+
+        Removes that user message and everything after it.
+        System message (index 0) is never removed.
+
+        Returns True if the target user message was found and removed.
+        """
+        count = 0
+        for i, msg in enumerate(self.items):
+            if i == 0:
+                continue  # skip system message
+            if getattr(msg, "role", None) == "user":
+                if count == user_message_index:
+                    self.items = self.items[:i]
+                    return True
+                count += 1
+        return False
+
+    async def compact(
+        self,
+        model_name: str,
+        tool_specs: list[dict] | None = None,
+        hf_token: str | None = None,
+    ) -> None:
+        """Remove old messages to keep history under target size"""
+        if (self.context_length <= self.max_context) or not self.items:
+            return
+
+        system_msg = (
+            self.items[0] if self.items and self.items[0].role == "system" else None
+        )
+
+        # Preserve the first user message (task prompt) — never summarize it
+        first_user_msg = None
+        first_user_idx = 1
+        for i in range(1, len(self.items)):
+            if getattr(self.items[i], "role", None) == "user":
+                first_user_msg = self.items[i]
+                first_user_idx = i
+                break
+
+        # Don't summarize a certain number of just-preceding messages
+        # Walk back to find a user message to make sure we keep an assistant -> user ->
+        # assistant general conversation structure
+        idx = len(self.items) - self.untouched_messages
+        while idx > 1 and self.items[idx].role != "user":
+            idx -= 1
+
+        recent_messages = self.items[idx:]
+        messages_to_summarize = self.items[first_user_idx + 1:idx]
+
+        # improbable, messages would have to very long
+        if not messages_to_summarize:
+            return
+
+        messages_to_summarize.append(
+            Message(
+                role="user",
+                content="Please provide a concise summary of the conversation above, focusing on key decisions, the 'why' behind the decisions, problems solved, and important context needed for developing further. Your summary will be given to someone who has never worked on this project before and they will be have to be filled in.",
+            )
+        )
+
+        hf_key = (
+            os.environ.get("INFERENCE_TOKEN")
+            or hf_token
+            or os.environ.get("HF_TOKEN")
+        )
+        response = await acompletion(
+            model=model_name,
+            messages=messages_to_summarize,
+            max_completion_tokens=self.compact_size,
+            tools=tool_specs,
+            api_key=hf_key
+            if hf_key and model_name.startswith("huggingface/")
+            else None,
+        )
+        summarized_message = Message(
+            role="assistant", content=response.choices[0].message.content
+        )
+
+        # Reconstruct: system + first user msg + summary + recent messages
+        head = [system_msg] if system_msg else []
+        if first_user_msg:
+            head.append(first_user_msg)
+        self.items = head + [summarized_message] + recent_messages
+
+        self.context_length = (
+            len(self.system_prompt) // 4 + response.usage.completion_tokens
+        )
