@@ -126,6 +126,7 @@ class ContextManager:
         # CLI-specific context for local mode
         if local_mode:
             import os
+
             cwd = os.getcwd()
             local_context = (
                 f"\n\n# CLI / Local mode\n\n"
@@ -293,7 +294,7 @@ class ContextManager:
             idx -= 1
 
         recent_messages = self.items[idx:]
-        messages_to_summarize = self.items[first_user_idx + 1:idx]
+        messages_to_summarize = self.items[first_user_idx + 1 : idx]
 
         # improbable, messages would have to very long
         if not messages_to_summarize:
@@ -306,19 +307,18 @@ class ContextManager:
             )
         )
 
-        hf_key = (
-            os.environ.get("INFERENCE_TOKEN")
-            or hf_token
-            or os.environ.get("HF_TOKEN")
-        )
+        # Reuse the main agent loop's provider resolver so copilot/HF-router
+        # model strings get rewritten + auth'd correctly. Without this,
+        # auto-compaction with a non-default provider blows up with
+        # "LLM Provider NOT provided" from LiteLLM.
+        from agent.core.agent_loop import _resolve_hf_router_params
+
+        llm_params = _resolve_hf_router_params(model_name, hf_token)
         response = await acompletion(
-            model=model_name,
             messages=messages_to_summarize,
             max_completion_tokens=self.compact_size,
             tools=tool_specs,
-            api_key=hf_key
-            if hf_key and model_name.startswith("huggingface/")
-            else None,
+            **llm_params,
         )
         summarized_message = Message(
             role="assistant", content=response.choices[0].message.content

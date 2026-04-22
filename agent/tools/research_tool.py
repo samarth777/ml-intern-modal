@@ -213,36 +213,29 @@ RESEARCH_TOOL_SPEC = {
 }
 
 
-def _resolve_llm_params(
-    model_name: str, session_hf_token: str | None = None
-) -> dict:
-    """Build LiteLLM kwargs, reusing the HF router logic from agent_loop."""
-    if not model_name.startswith("huggingface/"):
-        return {"model": model_name}
+def _resolve_llm_params(model_name: str, session_hf_token: str | None = None) -> dict:
+    """Build LiteLLM kwargs.
 
-    parts = model_name.split("/", 2)  # ["huggingface", "<provider>", "<org>/<model>"]
-    if len(parts) < 3:
-        return {"model": model_name}
+    Delegates to :func:`agent.core.agent_loop._resolve_hf_router_params`
+    so the research sub-agent supports the same provider routing as the
+    main loop (HF Router, GitHub Copilot, etc.) without us having to
+    duplicate the copilot/HF-router plumbing here.
+    """
+    from agent.core.agent_loop import _resolve_hf_router_params
 
-    provider = parts[1]
-    model_id = parts[2]
-    api_key = (
-        os.environ.get("INFERENCE_TOKEN")
-        or session_hf_token
-        or os.environ.get("HF_TOKEN")
-        or ""
-    )
-    return {
-        "model": f"openai/{model_id}",
-        "api_base": f"https://router.huggingface.co/{provider}/v3/openai",
-        "api_key": api_key,
-    }
+    return _resolve_hf_router_params(model_name, session_hf_token)
 
 
 def _get_research_model(main_model: str) -> str:
     """Pick a cheaper model for research based on the main model."""
     if "anthropic/" in main_model:
         return "anthropic/claude-sonnet-4-6"
+    if main_model.startswith("copilot/"):
+        # Copilot exposes the same family of models; downgrade Opus → Sonnet
+        # for research, but keep anything already ≤ Sonnet as-is.
+        if "opus" in main_model:
+            return "copilot/claude-sonnet-4.6"
+        return main_model
     # For non-Anthropic models (HF router etc.), use the same model
     return main_model
 
@@ -302,7 +295,9 @@ async def research_handler(
         # ── Doom-loop detection ──
         doom_prompt = check_for_doom_loop(messages)
         if doom_prompt:
-            logger.warning("Research sub-agent doom loop detected at iteration %d", _iteration)
+            logger.warning(
+                "Research sub-agent doom loop detected at iteration %d", _iteration
+            )
             await _log("Doom loop detected — injecting corrective prompt")
             messages.append(Message(role="user", content=doom_prompt))
 
@@ -312,15 +307,19 @@ async def research_handler(
                 "Research sub-agent hit context max (%d tokens) — forcing summary",
                 _total_tokens,
             )
-            await _log(f"Context limit reached ({_total_tokens} tokens) — forcing wrap-up")
+            await _log(
+                f"Context limit reached ({_total_tokens} tokens) — forcing wrap-up"
+            )
             # Ask for a final summary with no tools
-            messages.append(Message(
-                role="user",
-                content=(
-                    "[SYSTEM: CONTEXT LIMIT REACHED] You have used all available context. "
-                    "Summarize your findings NOW. Do NOT call any more tools."
-                ),
-            ))
+            messages.append(
+                Message(
+                    role="user",
+                    content=(
+                        "[SYSTEM: CONTEXT LIMIT REACHED] You have used all available context. "
+                        "Summarize your findings NOW. Do NOT call any more tools."
+                    ),
+                )
+            )
             try:
                 response = await acompletion(
                     messages=messages,
@@ -330,21 +329,26 @@ async def research_handler(
                     **llm_params,
                 )
                 content = response.choices[0].message.content or ""
-                return content or "Research context exhausted — no summary produced.", bool(content)
+                return (
+                    content or "Research context exhausted — no summary produced.",
+                    bool(content),
+                )
             except Exception:
                 return "Research context exhausted and summary call failed.", False
 
         if not _warned_context and _total_tokens >= _RESEARCH_CONTEXT_WARN:
             _warned_context = True
             await _log(f"Context at {_total_tokens} tokens — nudging to wrap up")
-            messages.append(Message(
-                role="user",
-                content=(
-                    "[SYSTEM: You have used 75% of your context budget. "
-                    "Start wrapping up: finish any critical lookups, then "
-                    "produce your final summary within the next 1-2 iterations.]"
-                ),
-            ))
+            messages.append(
+                Message(
+                    role="user",
+                    content=(
+                        "[SYSTEM: You have used 75% of your context budget. "
+                        "Start wrapping up: finish any critical lookups, then "
+                        "produce your final summary within the next 1-2 iterations.]"
+                    ),
+                )
+            )
 
         try:
             response = await acompletion(
@@ -429,13 +433,15 @@ async def research_handler(
 
     # ── Iteration limit: try to salvage findings ──
     await _log("Iteration limit reached — extracting summary")
-    messages.append(Message(
-        role="user",
-        content=(
-            "[SYSTEM: ITERATION LIMIT] You have reached the maximum number of research "
-            "iterations. Summarize ALL findings so far. Do NOT call any more tools."
-        ),
-    ))
+    messages.append(
+        Message(
+            role="user",
+            content=(
+                "[SYSTEM: ITERATION LIMIT] You have reached the maximum number of research "
+                "iterations. Summarize ALL findings so far. Do NOT call any more tools."
+            ),
+        )
+    )
     try:
         response = await acompletion(
             messages=messages,
