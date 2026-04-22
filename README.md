@@ -16,6 +16,11 @@ papers, datasets, and cloud compute. **Compute is powered by [Modal](https://mod
 by default** (sandboxes + jobs); the original Hugging Face Spaces backend is
 still available behind a config flag.
 
+> See [`examples/peer-review-scorer.md`](examples/peer-review-scorer.md)
+> for an end-to-end run: one prompt → finds the latest HF dataset →
+> drafts the training script in a Modal sandbox → fine-tunes on a Modal
+> A10G job → pushes the model and Trackio dashboard to HF.
+
 ## Quick Start
 
 ### Installation
