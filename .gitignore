@@ -26,6 +26,9 @@ env/
 *.local
 credentials*.json
 
+# Local reference checkout — not part of this fork.
+opencode/
+
 # OS-specific
 .DS_Store
 Thumbs.db

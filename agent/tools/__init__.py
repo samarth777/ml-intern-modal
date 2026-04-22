@@ -1,39 +1,12 @@
-"""
-Hugging Face tools for the agent
-"""
+"""Agent tools package.
 
-from agent.tools.dataset_tools import (
-    HF_INSPECT_DATASET_TOOL_SPEC,
-    hf_inspect_dataset_handler,
-)
-from agent.tools.github_find_examples import (
-    GITHUB_FIND_EXAMPLES_TOOL_SPEC,
-    github_find_examples_handler,
-)
-from agent.tools.github_list_repos import (
-    GITHUB_LIST_REPOS_TOOL_SPEC,
-    github_list_repos_handler,
-)
-from agent.tools.github_read_file import (
-    GITHUB_READ_FILE_TOOL_SPEC,
-    github_read_file_handler,
-)
-from agent.tools.jobs_tool import HF_JOBS_TOOL_SPEC, HfJobsTool, hf_jobs_handler
-from agent.tools.types import ToolResult
+Keep this file *empty of side-effecting imports*. It is loaded whenever
+any ``agent.tools.*`` submodule is re-imported inside a Modal job worker
+(via ``agent.tools.modal_jobs_tool`` deserialization), and the worker
+container only ships the user's pip deps. Eager re-exports here would
+pull in ``thefuzz``, ``huggingface_hub``, ``fastmcp``, etc., none of
+which the lightweight job image installs.
 
-__all__ = [
-    "ToolResult",
-    "HF_JOBS_TOOL_SPEC",
-    "hf_jobs_handler",
-    "HfJobsTool",
-    "GITHUB_FIND_EXAMPLES_TOOL_SPEC",
-    "github_find_examples_handler",
-    "GITHUB_LIST_REPOS_TOOL_SPEC",
-    "github_list_repos_handler",
-    "GITHUB_READ_FILE_TOOL_SPEC",
-    "github_read_file_handler",
-    "GITHUB_SEARCH_CODE_TOOL_SPEC",
-    "github_search_code_handler",
-    "HF_INSPECT_DATASET_TOOL_SPEC",
-    "hf_inspect_dataset_handler",
-]
+Importers should use the submodule path directly:
+``from agent.tools.jobs_tool import HF_JOBS_TOOL_SPEC``.
+"""

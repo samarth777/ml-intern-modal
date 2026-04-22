@@ -33,10 +33,23 @@ import time
 import uuid
 from datetime import datetime
 from threading import Lock
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional, TYPE_CHECKING
 
-from agent.core.session import Event
-from agent.tools.types import ToolResult
+# IMPORTANT: do NOT import from agent.* at module top.
+#
+# ``_python_job`` / ``_command_job`` are defined at module top level so
+# Modal can pickle them by reference. The Modal worker re-imports this
+# module to deserialize them, which transitively re-runs every top-level
+# import here. The job container only has the user's pip deps + a thin
+# stdlib layer — pulling in ``agent.*`` modules that depend on
+# ``fastmcp`` / ``litellm`` would cause ``ModuleNotFoundError``. We rely
+# on ``agent/__init__.py`` being side-effect-free for the same reason.
+#
+# Agent symbols (Event, ToolResult) are imported lazily inside the
+# methods that use them. Type-checkers see them via the TYPE_CHECKING block.
+if TYPE_CHECKING:
+    from agent.core.session import Event
+    from agent.tools.types import ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -192,7 +205,6 @@ def _python_job(script_b64: str, script_args: list[str] | None = None) -> int:
     import tempfile as _tf
 
     src = _b64.b64decode(script_b64).decode("utf-8")
-    # Write to a temp .py file so tracebacks reference real line numbers.
     with _tf.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
         f.write(src)
         path = f.name
@@ -309,6 +321,10 @@ class ModalJobsTool:
 
     async def _run_job(self, args: Dict[str, Any]) -> ToolResult:
         import modal
+
+        # Lazy import — see module-top comment about avoiding agent.* at module
+        # scope so Modal worker re-imports don't pull in fastmcp/litellm.
+        from agent.core.session import Event
 
         script = args.get("script")
         command = args.get("command")
@@ -461,6 +477,9 @@ class ModalJobsTool:
         ``get_gen()``-style API where available, falling back to polling
         ``.logs`` on the underlying FunctionCall.
         """
+        # Lazy import — see module-top comment.
+        from agent.core.session import Event
+
         info = _REGISTRY.get(call_id)
         if not info:
             return "UNKNOWN", []

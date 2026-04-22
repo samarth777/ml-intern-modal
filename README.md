@@ -6,10 +6,14 @@
 
 # ML Intern · Modal
 
+Fork of [`huggingface/ml-intern`](https://github.com/huggingface/ml-intern)
+that adds [Modal](https://modal.com) as a compute backend (sandboxes +
+jobs) and a `modal deploy`-able FastAPI app.
+
 An ML intern that autonomously researches, writes, and ships good quality ML
 related code using the Hugging Face ecosystem — with deep access to docs,
 papers, datasets, and cloud compute. **Compute is powered by [Modal](https://modal.com)
-by default** (sandboxes + jobs); the legacy Hugging Face Spaces backend is
+by default** (sandboxes + jobs); the original Hugging Face Spaces backend is
 still available behind a config flag.
 
 ## Quick Start
@@ -17,8 +21,8 @@ still available behind a config flag.
 ### Installation
 
 ```bash
-git clone git@github.com:huggingface/ml-intern.git
-cd ml-intern
+git clone https://github.com/samarth777/ml-intern-modal.git
+cd ml-intern-modal
 uv sync
 uv tool install -e .
 ```
@@ -301,7 +305,7 @@ modal secret create ml-intern-secrets \
     OAUTH_CLIENT_ID=... \
     OAUTH_CLIENT_SECRET=... \
     OPENID_PROVIDER_URL=https://huggingface.co \
-    HF_OAUTH_ORG_ID=698dbf55845d85df163175f1
+    HF_OAUTH_ORG_ID=... \
 ```
 
 ### 3. Build the frontend
@@ -335,3 +339,11 @@ OAuth app (`<url>/auth/callback`) and you're live.
 The deployment is pinned to `min_containers=1, max_containers=1` to
 preserve the in-process session manager's semantics. Horizontal scaling
 would require moving session state to a shared store first.
+
+## Acknowledgments
+
+Built on top of [`huggingface/ml-intern`](https://github.com/huggingface/ml-intern)
+by Hugging Face — all credit for the agent, tools, prompts, and UI goes
+to them. This fork only adds the Modal compute backend
+(`agent/tools/modal_{sandbox,jobs}_tool.py`, `modal_app.py`) and a
+GitHub Copilot provider.

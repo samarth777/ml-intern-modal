@@ -11,6 +11,15 @@ from dataclasses import dataclass
 from litellm import ChatCompletionMessageToolCall, Message, acompletion
 from litellm.exceptions import ContextWindowExceededError
 
+# Opt-in verbose LiteLLM debug logging. Set LITELLM_DEBUG=1 in .env to surface
+# raw provider request/response bodies and HTTP status codes — useful for
+# diagnosing 4xx errors from custom OpenAI-compatible endpoints (Copilot, HF
+# Router, etc.) where LiteLLM normally swallows the upstream response body.
+if os.environ.get("LITELLM_DEBUG", "").lower() in ("1", "true", "yes"):
+    import litellm as _litellm
+
+    _litellm._turn_on_debug()
+
 from agent.config import Config
 from agent.core.doom_loop import check_for_doom_loop
 from agent.core.session import Event, OpType, Session
