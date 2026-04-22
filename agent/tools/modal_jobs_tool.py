@@ -191,12 +191,21 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
 
-def _python_job(script_b64: str, script_args: list[str] | None = None) -> int:
+def _python_job(
+    script_b64: str,
+    script_args: list[str] | None = None,
+    log_queue: Any = None,
+) -> int:
     """Decode + execute a user Python script inside a Modal container.
 
     Defined at module top-level so Modal can serialize it. Uses subprocess
     so stdout/stderr stream as the script runs and the parent gets a real
     exit code (rather than a Python exception we'd have to translate).
+
+    If ``log_queue`` is provided (a hydrated ``modal.Queue`` handle),
+    every output line is also pushed onto the queue so the controlling
+    process can stream them back to the user in real time. The queue
+    write is best-effort — a broken queue must never kill the job.
     """
     import base64 as _b64
     import os as _os
@@ -214,7 +223,18 @@ def _python_job(script_b64: str, script_args: list[str] | None = None) -> int:
         assert proc.stdout is not None
         for line in proc.stdout:
             print(line, end="", flush=True)
-        return proc.wait()
+            if log_queue is not None:
+                try:
+                    log_queue.put(line, partition="logs")
+                except Exception:
+                    pass
+        rc = proc.wait()
+        if log_queue is not None:
+            try:
+                log_queue.put(None, partition="logs")  # sentinel = EOF
+            except Exception:
+                pass
+        return rc
     finally:
         try:
             _os.unlink(path)
@@ -222,15 +242,29 @@ def _python_job(script_b64: str, script_args: list[str] | None = None) -> int:
             pass
 
 
-def _command_job(command: list[str]) -> int:
-    """Execute a Docker-mode command (raw argv list) inside a Modal container."""
+def _command_job(command: list[str], log_queue: Any = None) -> int:
+    """Execute a Docker-mode command (raw argv list) inside a Modal container.
+
+    See :func:`_python_job` for the ``log_queue`` contract.
+    """
     import subprocess as _sp
 
     proc = _sp.Popen(command, stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True, bufsize=1)
     assert proc.stdout is not None
     for line in proc.stdout:
         print(line, end="", flush=True)
-    return proc.wait()
+        if log_queue is not None:
+            try:
+                log_queue.put(line, partition="logs")
+            except Exception:
+                pass
+    rc = proc.wait()
+    if log_queue is not None:
+        try:
+            log_queue.put(None, partition="logs")
+        except Exception:
+            pass
+    return rc
 
 
 # ── Async wrappers ─────────────────────────────────────────────────────
@@ -373,15 +407,28 @@ class ModalJobsTool:
         if gpu:
             fn_kwargs["gpu"] = gpu
 
+        # Open an ephemeral queue used as a side-channel for log lines.
+        # The worker pushes each subprocess output line onto it; the
+        # async loop below drains it and forwards lines to the agent in
+        # real time. Modal hydrates the Queue handle on the worker side
+        # automatically when it's passed as a function argument.
+        #
+        # The queue context must stay open for the entire job lifetime —
+        # we tear it down in the ``finally`` block at the end of the run.
+        # Use the ``.aio`` interface to avoid Modal's AsyncUsageWarning
+        # (the sync ``__enter__`` would block this asyncio loop).
+        queue_ctx = modal.Queue.ephemeral()
+        log_queue = await queue_ctx.__aenter__()
+
         # Register the worker function with the ephemeral app.
         if script:
             script_b64 = base64.b64encode(script.encode("utf-8")).decode("utf-8")
             script_args = args.get("script_args") or []
             worker = app.function(**fn_kwargs)(_python_job)
-            launch_args: tuple = (script_b64, script_args)
+            launch_args: tuple = (script_b64, script_args, log_queue)
         else:
             worker = app.function(**fn_kwargs)(_command_job)
-            launch_args = (list(command),)
+            launch_args = (list(command), log_queue)
 
         # Spawn the job in the background — the run() context only needs to
         # stay open long enough to register the Function; ``spawn`` returns
@@ -417,6 +464,7 @@ class ModalJobsTool:
                 "status": "RUNNING",
                 "url": job_url,
                 "function_call": function_call,
+                "log_queue": log_queue,
                 "logs": [],
             },
         )
@@ -438,8 +486,16 @@ class ModalJobsTool:
                 )
             )
 
-        # Block until the job finishes, streaming logs.
-        final_status, all_logs = await self._wait_for_completion(call_id, timeout_s)
+        # Block until the job finishes, streaming logs. Always tear down
+        # the ephemeral Queue afterwards — leaking it would keep a Modal
+        # object alive until process exit.
+        try:
+            final_status, all_logs = await self._wait_for_completion(call_id, timeout_s)
+        finally:
+            try:
+                await queue_ctx.__aexit__(None, None, None)
+            except Exception:
+                logger.debug("Failed to close ephemeral log queue", exc_info=True)
 
         if self.session:
             self.session._running_job_ids.discard(call_id)
@@ -469,44 +525,42 @@ class ModalJobsTool:
     async def _wait_for_completion(
         self, call_id: str, timeout_s: int
     ) -> tuple[str, list[str]]:
-        """Poll the FunctionCall, draining logs from the registry as we go.
+        """Wait for the FunctionCall to finish, streaming logs in real time.
 
-        Modal's Python SDK lets us call ``FunctionCall.get(timeout=...)``
-        which blocks until the call finishes (or raises on timeout). We do
-        this in a worker thread and parallelize log streaming via the SDK's
-        ``get_gen()``-style API where available, falling back to polling
-        ``.logs`` on the underlying FunctionCall.
+        Modal doesn't expose a public log-streaming API on FunctionCall,
+        so the worker pushes lines onto a ``modal.Queue`` instead. We
+        drain that queue from a worker thread (``modal.Queue.get`` is
+        synchronous) and forward each line to ``self.log_callback`` in
+        the asyncio loop. The worker pushes a ``None`` sentinel after
+        the subprocess exits, which closes the drain cleanly.
         """
-        # Lazy import — see module-top comment.
-        from agent.core.session import Event
-
         info = _REGISTRY.get(call_id)
         if not info:
             return "UNKNOWN", []
         function_call = info["function_call"]
+        modal_queue = info.get("log_queue")
         all_logs: list[str] = info.setdefault("logs", [])
 
         loop = asyncio.get_running_loop()
-        log_queue: asyncio.Queue = asyncio.Queue()
+        line_queue: asyncio.Queue = asyncio.Queue()
+        SENTINEL = object()
 
-        def _drain_logs() -> None:
-            """Best-effort log streaming — Modal SDK exposes this differently
-            across versions; we try the common shapes and gracefully no-op."""
-            try:
-                gen = getattr(function_call, "get_gen", None)
-                if callable(gen):
-                    for line in gen():
-                        loop.call_soon_threadsafe(log_queue.put_nowait, line)
-                    return
-            except Exception:
-                pass
-            # Fall back: just sleep until completion is signalled.
+        def _drain_modal_queue() -> None:
+            """Block on the Modal queue and forward lines into the asyncio queue."""
+            if modal_queue is None:
+                return
             while True:
-                if loop.is_closed():
-                    return
-                time.sleep(2)
-                if info.get("_done"):
-                    return
+                try:
+                    line = modal_queue.get(timeout=2.0, partition="logs")
+                except Exception:
+                    # Timeout — bail out if the job has finished, otherwise loop.
+                    if info.get("_done"):
+                        break
+                    continue
+                if line is None:  # worker EOF sentinel
+                    break
+                loop.call_soon_threadsafe(line_queue.put_nowait, line)
+            loop.call_soon_threadsafe(line_queue.put_nowait, SENTINEL)
 
         def _await_result() -> str:
             try:
@@ -524,34 +578,28 @@ class ModalJobsTool:
             finally:
                 info["_done"] = True
 
-        log_task = loop.run_in_executor(None, _drain_logs)
+        log_task = loop.run_in_executor(None, _drain_modal_queue)
         result_task = loop.run_in_executor(None, _await_result)
 
-        # Forward log lines to the agent until the call finishes.
-        while not result_task.done():
+        # Forward log lines to the agent until the drain thread signals EOF
+        # *and* the result is in. We deliberately don't bail early on
+        # ``result_task.done()`` — there may still be queued lines in flight.
+        drain_done = False
+        while not (drain_done and result_task.done()):
             try:
-                line = await asyncio.wait_for(log_queue.get(), timeout=1.0)
+                item = await asyncio.wait_for(line_queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
-            if line is None:
+            if item is SENTINEL:
+                drain_done = True
                 continue
+            line = item
             all_logs.append(line)
             if self.log_callback:
                 try:
                     await self.log_callback(line)
                 except Exception:
                     logger.debug("log_callback raised", exc_info=True)
-
-        # Drain any remaining queued lines.
-        while not log_queue.empty():
-            line = log_queue.get_nowait()
-            if line:
-                all_logs.append(line)
-                if self.log_callback:
-                    try:
-                        await self.log_callback(line)
-                    except Exception:
-                        pass
 
         final_status = await result_task
         try:
