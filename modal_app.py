@@ -55,7 +55,11 @@ image = (
         "uv pip install --system --no-cache modal>=0.66",
     )
     # Mount source code as Python modules so imports resolve.
+    # ``add_local_python_source`` only copies ``.py`` files, so the
+    # ``agent/prompts/*.yaml`` system-prompt files (loaded at runtime by
+    # ContextManager) need to ride along as a separate local-dir mount.
     .add_local_python_source("agent")
+    .add_local_dir(PROJECT_ROOT / "agent" / "prompts", "/root/agent/prompts")
     .add_local_dir(PROJECT_ROOT / "backend", "/root/backend")
     .add_local_dir(PROJECT_ROOT / "configs", "/root/configs")
 )
